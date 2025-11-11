@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+outputs/
+*.pt
+*.zip
+.ipynb_checkpoints/
+# Full video sets: store with Git LFS. Small previews may be committed.
+videos/**/*.mp4
+!videos/**/preview_*.mp4

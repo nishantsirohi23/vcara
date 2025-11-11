@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use V-CARA, please cite it as below."
+title: "V-CARA: Uncertainty-Gated Counterfactual Reinforcement Learning for Visual Control on an Infinite Track"
+type: software
+authors:
+  - family-names: Sirohi
+    given-names: Nishant
+date-released: 2026-10-01
+license: MIT
+repository-code: "https://github.com/vcara/vcara"
+keywords:
+  - reinforcement learning
+  - soft actor-critic
+  - visual control
+  - counterfactual action evaluation

@@ -1,0 +1,6 @@
+# No-counterfactual ablation: vcara_full with local counterfactual evaluation off.
+variant: vcara_no_cf
+inherits: vcara_full.yaml
+use_cf: false
+use_gate: false
+use_risk: false
