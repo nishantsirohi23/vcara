@@ -1,0 +1,811 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{newtxtext,newtxmath}
+\usepackage{amsmath,array,calc}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{etoolbox}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{caption}
+\newcommand{\real}[1]{#1}
+\providecommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\AtBeginEnvironment{longtable}{\scriptsize}
+\setlist{nosep}
+\setlength{\parskip}{4pt}
+\setlength{\parindent}{0pt}
+\title{V-CARA: Uncertainty-Gated Counterfactual Reinforcement Learning for Visual Control on an Infinite Track}
+\author{Nishant Sirohi}
+\date{October 2026}
+\begin{document}
+\maketitle
+
+
+\begin{abstract}
+
+Visual control on an effectively unbounded track requires sustained
+progress while balancing speed, stability, and off-track risk. We
+present V-CARA, a visual reinforcement-learning system built on Soft
+Actor-Critic (SAC) and augmented with an ensemble of latent transition
+models, uncertainty-gated local counterfactual action evaluation, a risk
+estimator, future-coverage prediction, and coverage-aware replay. The
+agent consumes four stacked 64 by 64 grayscale frames and uses a
+time-aware state representation. We analyze the seed-42
+evaluation trajectory through 1,000,000 environment frames and a V-CARA
+ablation with counterfactual evaluation disabled through 450,002 frames.
+At one million frames, V-CARA records mean return 875.7 \(\pm\) 30.0,
+mean coverage 0.985, median coverage 0.980, P90 coverage 0.998, off-road
+fraction 0.090, mean speed 65.0, and T90 of 650 frames. In the common
+training window, the no-CF variant learns high coverage earlier at some
+checkpoints, while full V-CARA has substantially lower off-road fraction
+and higher coverage around 250k--325k frames; the difference is not
+uniform across all checkpoints. The results motivate reporting progress,
+coverage distributions, off-road behaviour, speed, and time-to-threshold
+jointly rather than relying on return alone.
+
+\textbf{Keywords:} visual reinforcement learning; autonomous control;
+Soft Actor-Critic; counterfactual action evaluation; latent dynamics;
+uncertainty gating; risk-sensitive control.
+
+\end{abstract}
+\section{Introduction}\label{introduction}
+
+Visual continuous control is difficult because observations are images
+rather than direct access to the full physical state. The controller
+must infer motion, track geometry, and the consequences of steering and
+throttle from temporally correlated visual input. On an effectively
+unbounded track, the objective is to sustain forward progress while
+managing speed and avoiding off-road states.
+
+A single aggregate reward can conceal important behaviour. A high-return
+policy may be fast but unstable, while a conservative policy may reduce
+off-road events at the expense of progress. Coverage is therefore
+reported alongside return, median and upper-quantile coverage, off-road
+fraction, speed, and time to 90\% coverage (T90). This paper describes
+V-CARA and compares the full system with an ablation that disables local
+counterfactual evaluation (no-CF).
+
+The contribution is an integrated description of the algorithm, the
+implementation corrections that motivated it, and a transparent analysis
+of the recorded training trajectories. The paper does not interpret one
+training seed as evidence of universal superiority. Instead, it
+identifies where the two recorded runs differ, where they do not, and
+which conclusions remain limited by the available evaluation design.
+
+\section{Background and Related Work}\label{background-and-related-work}
+
+V-CARA uses Soft Actor-Critic as its off-policy continuous-control
+backbone. SAC optimizes expected return together with an entropy term,
+encouraging a stochastic policy while learning from replay. The
+maximum-entropy formulation is useful when the action consequences are
+uncertain and exploration is important (Haarnoja et al., 2018).
+
+Model-based reinforcement learning learns a predictive model and uses it
+to evaluate candidate actions or generate learning signals. Such methods
+can improve data efficiency, but their benefit depends on model fidelity
+and on how prediction error compounds over rollout horizon (Janner et
+al., 2019). V-CARA uses a short-horizon latent transition ensemble
+rather than relying on long open-loop image prediction.
+
+Ensembles provide a practical proxy for epistemic uncertainty:
+disagreement among independently trained predictors can indicate states
+or actions where the model is less reliable. This signal is not a
+calibrated probability of failure; it is used as a gate that limits
+counterfactual influence when disagreement is high. Replay-based
+learning can also be sensitive to which experiences are sampled.
+Prioritized replay established the value of non-uniform sampling based
+on learning relevance (Schaul et al., 2016); V-CARA instead uses
+progress-quality partitions intended to retain useful high-coverage and
+elite transitions.
+
+Deep reinforcement learning results can vary substantially across random
+seeds and implementation details, making complete reporting important
+(Henderson et al., 2018). Accordingly, the numerical findings below are
+framed as observations from the recorded seed-42 trajectories, not as a
+multi-seed estimate.
+
+\section{Problem Formulation}\label{problem-formulation}
+
+Let the environment be a partially observed control process. At time t,
+the latent physical state is s\_t, the image observation is o\_t, and
+the continuous action is a\_t. The policy receives a stack of recent
+images and a time feature, then emits steering, throttle, and brake
+controls. The environment advances with action repeat r=4, so a single
+policy action is held for several simulator frames.
+
+The objective is sustained progress under a finite episode horizon, with
+penalties or termination rules for off-road behaviour, out-of-field
+states, and stalls. Because the track is effectively infinite,
+evaluation focuses on continuous progress rather than terminal-event
+metrics. Coverage \(c_t\in[0,1]\) denotes normalized progress within the
+evaluation horizon; it is an operational metric rather than a terminal
+event. T90 is the number of episode frames needed to reach coverage
+0.90; a value of -1 indicates that the threshold was not reached in the
+recorded summary.
+
+The primary evaluation vector is m=(R, C\_mean, C\_median, C\_P90, O, V,
+T90), where R is mean return, C values summarize episode-level coverage,
+O is off-road fraction, and V is mean speed. Lower O and lower T90 are
+generally desirable; speed is interpreted jointly with coverage and
+off-road behaviour rather than maximized without constraint.
+
+\section{V-CARA Method}\label{v-cara-method}
+
+\subsection{Overview}\label{overview}
+
+V-CARA combines a visual SAC agent with five supporting mechanisms: (i)
+a convolutional encoder over stacked grayscale images; (ii) a compact
+latent-dynamics ensemble; (iii) local counterfactual action evaluation
+with uncertainty gating; (iv) auxiliary risk and future-coverage
+prediction; and (v) replay sampling that emphasizes progress and
+high-quality trajectories. Time-aware inputs and explicit stall/timeout
+handling address temporal and termination semantics.
+
+\subsection{Visual encoder and
+actor--critic}\label{visual-encoder-and-actorcritic}
+
+The observation is resized to 64 by 64 grayscale and stacked over four
+frames. A convolutional encoder maps the stack to a 128-dimensional
+feature vector. An actor maps features to a distribution over continuous
+actions. Twin critics estimate soft action values, and target critics
+are updated by exponential moving average. The saved configuration uses
+discount \(\gamma=0.99\), target update \(\tau=0.005\), actor learning
+rate \(10^{-4}\), critic learning rate 2\(\times\)\(10^{-4}\), batch size 256,
+replay capacity 300,000, and one gradient update per environment step.
+
+\subsection{Latent transition
+ensemble}\label{latent-transition-ensemble}
+
+An ensemble of three predictors estimates the next latent feature given
+the current feature and action. Let f\_t be the encoded state and g\_j
+the j-th predictor. Each model predicts the next latent state from the
+current feature and action. The ensemble mean is computed by averaging
+the predicted next-state features: \[
+\hat{\mu}_{t+1}=\frac{1}{K}\sum_{j=1}^{K}\hat{f}_{t+1}^{(j)}.
+\] Disagreement is represented by a scalar u\_t, computed from
+dispersion across predictions after normalization to a reference scale.
+The uncertainty value is a model diagnostic and should not be
+interpreted as a calibrated confidence probability.
+
+\subsection{Counterfactual action
+evaluation}\label{counterfactual-action-evaluation}
+
+Given the actor action, V-CARA constructs a small local set of candidate
+actions that includes the actor action and bounded perturbations around
+it. Candidates are clipped to the action bounds and scored using
+predicted value, risk, progress, and model disagreement. A generic
+candidate score is: \[
+S(a)=\bar{Q}(z,a)-\beta_r\hat{R}(z,a)+\lambda_p\hat{P}(z,a)-\lambda_u\hat{U}(z,a),
+\] where Q-bar is the twin-critic aggregate, R-hat is predicted risk,
+P-hat is predicted progress, and U-hat is model disagreement. The materials available for this manuscript do not specify numerical values
+for $\beta_r$, $\lambda_p$, or $\lambda_u$. These values cannot be
+recovered from aggregate evaluation summaries and are marked as not reported
+rather than inferred. The evaluation CSV is a derived checkpoint summary, not
+a substitute for the raw per-episode evaluation records.
+
+Counterfactual influence is gated by model reliability. The gate combines
+an uncertainty-threshold test, a warm-up eligibility flag, and an additional
+quality gate $q_t$. The candidate-action rule below makes the decision
+explicit: use the actor action if uncertainty exceeds the limit, eligibility
+conditions fail, or the candidate does not exceed the actor score by the
+required margin; otherwise use the selected candidate. The exact interaction
+between the quality gate and action selection should be verified against the
+experiment code before publication. In the saved
+configuration, the uncertainty limit is 1.5, the counterfactual margin
+is 0.02, target acceptance rate is 0.25, fixed horizon is 3, and
+warm-up/ramp is 10,000 frames. A key V2 correction was to put
+uncertainty and acceptance statistics on compatible scales so the
+mechanism does not remain effectively inactive.
+
+\subsection{Risk and progress
+prediction}\label{risk-and-progress-prediction}
+
+A risk head predicts near-term off-road or unsafe-state likelihood. A
+progress head estimates future progress from latent features. These
+auxiliary signals help distinguish candidate actions that obtain
+short-term reward from those that preserve stable forward movement. The
+risk objective is trained from available transition labels, while
+progress prediction uses transition-local targets rather than a single
+episode-wide label.
+
+\subsection{Future-coverage
+prediction}\label{future-coverage-prediction}
+
+A future-coverage classifier estimates whether a state is likely to
+reach a high-coverage threshold within a finite prediction window. The
+label is attached to each transition according to its own future
+trajectory, rather than propagating an episode-level success label to
+all early states. A quality gate based on positive-label availability
+and balanced accuracy prevents noisy early predictions from dominating
+actor updates. This classifier is an auxiliary progress signal, not a
+terminal-success detector.
+
+\subsection{Coverage-aware replay}\label{coverage-aware-replay}
+
+Replay is partitioned into ordinary, near-high-coverage, and elite
+transitions. The saved mixture is 0.625 ordinary, 0.250
+near-high-coverage, and 0.125 elite, subject to buffer availability.
+Near-high-coverage begins at 0.75 coverage; elite coverage begins at
+0.90 with maximum off-road fraction 0.15. The replay rule uses
+trajectory quality and coverage, not only the environment's termination
+flag. This corrects an earlier failure where useful time-limit or stall
+trajectories were omitted from high-quality buffers.
+
+\subsection{Action mapping and episode
+semantics}\label{action-mapping-and-episode-semantics}
+
+The wrapper uses action repeat 4, a 1,000-step time limit, a 160-frame
+stall threshold, and a brake dead zone of 0.6. Weak brake outputs are
+mapped to zero to avoid unintended deceleration. The system
+distinguishes genuine terminal events from time-limit truncations when
+constructing critic targets. A stall mode applies an explicit penalty
+schedule over up to 400 frames; no terminal progress bonus is used
+because the track has no endpoint.
+
+\subsubsection{Objective and uncertainty
+gate}\label{objective-and-uncertainty-gate}
+
+The SAC critic objective is \[
+J_Q(\phi)=\mathbb{E}_{(s,a,r,s')\sim\mathcal D}
+\left[\frac12\left(Q_\phi(s,a)-y\right)^2\right],
+\] with soft target \[
+y=r+\gamma(1-d)\left(\min_i Q_{\bar\phi_i}(s',a')-\alpha\log\pi(a'|s')\right).
+\] For local counterfactual candidates \(a^{(j)}\), the score is \[
+S(a^{(j)})=\bar Q(z,a^{(j)})-\beta_r\hat R(z,a^{(j)})
++\lambda_p\hat P(z,a^{(j)})-\lambda_u\hat U(z,a^{(j)}).
+\] The counterfactual action is accepted only when the uncertainty and
+eligibility gates pass and its score is at least the actor score plus the
+margin $\delta$. Equivalently, the manuscript-level action rule is
+\[
+a_t=\begin{cases}
+ a_{\pi}, & \hat U(z,a^{(j^*)})>u_{\max}\ \text{or eligibility fails, or}\ S(a^{(j^*)})<S(a_\pi)+\delta,\\
+ a^{(j^*)}, & \text{otherwise}.
+\end{cases}
+\]
+This rule is intended to match the prose in Section 4.4, but it has not been
+verified against source code; the exact interaction with the quality gate
+requires implementation-level confirmation.
+The available materials do not state the perturbation magnitude or exact
+candidate offsets, the risk-head calibration procedure, or all auxiliary-loss
+coefficients. These are material reproducibility gaps: the aggregate results
+cannot identify them. The reported uncertainty limit (1.5), counterfactual
+margin (0.02), target acceptance rate (0.25), fixed horizon (3), and 10,000-frame
+warm-up/ramp are documented, but they do not substitute for the missing values.
+
+\subsection{Parameter disclosure and reproducibility status}\label{parameter-disclosure}
+
+Table~\ref{tab:parameter-disclosure} distinguishes reported configuration values from parameters not specified in the method description. Missing values are not guessed. A reproducible release must include the exact run configuration or code commit that generated these logs.
+
+\begin{longtable}{p{0.32\linewidth}p{0.19\linewidth}p{0.39\linewidth}}
+\caption{Reported and missing implementation parameters.}\label{tab:parameter-disclosure}\\
+\toprule
+Parameter & Status & Value or note \\
+\midrule
+\endfirsthead
+\caption[]{Reported and missing implementation parameters (continued).}\\
+\toprule
+Parameter & Status & Value or note \\
+\midrule
+\endhead
+Observation size / stack & Reported & $64\times64$ grayscale; 4 frames \\
+Latent ensemble size & Reported & 3 predictors \\
+Discount / target update & Reported & $\gamma=0.99$, $\tau=0.005$ \\
+Actor / critic learning rate & Reported & $10^{-4}$ / $2\times10^{-4}$ \\
+Batch / replay capacity & Reported & 256 / 300,000 \\
+Uncertainty limit / score margin & Reported & 1.5 / 0.02 \\
+Target acceptance rate / horizon & Reported & 0.25 / 3 \\
+Warm-up/ramp & Reported & 10,000 frames \\
+Counterfactual perturbation magnitude and offsets & Not reported & Exact candidate action deltas unavailable \\
+Score weights $\beta_r,\lambda_p,\lambda_u$ & Not reported & Numerical values unavailable \\
+Risk calibration & Not reported & Calibration method, data split, and metric unavailable \\
+Auxiliary-loss coefficients & Not reported & Complete coefficient list unavailable \\
+Counterfactual acceptance counts by checkpoint & Not reported & Per-checkpoint gate/acceptance counts are not reported \\
+\bottomrule
+\end{longtable}
+
+\section{Experimental Setup}\label{experimental-setup}
+
+The full V-CARA evaluation series contains checkpoints from 100,000
+through 1,000,000 environment frames. The separate no-CF seed-42 log
+contains checkpoints from 25,000 through 450,002 frames. The no-CF
+variant disables local counterfactual evaluation while retaining the
+broader learning system. The runs share the reported seed identifier,
+but because only one seed per variant is represented, differences are
+descriptive rather than a reliable estimate of across-seed treatment
+effects.
+
+The full V-CARA table reports mean return with standard deviation, mean
+coverage, median coverage, P90 coverage, off-road fraction, mean speed,
+and T90. The no-CF log additionally reports exponential moving average
+(EMA) return and out-of-field (OOF) fraction. The periodic
+evaluation summaries are treated as the recorded values; no missing
+checkpoints are interpolated for numerical tables.
+
+For matched-window comparison, checkpoints are paired approximately by
+training frames, with differences of a few frames preserved in the
+source logs. This is not a paired statistical test: the metric is
+evaluated from a single seed trajectory for each condition. A robust
+confirmatory study would use multiple independent training seeds and a
+fixed, shared evaluation seed set.
+
+\section{Results}\label{results}
+
+\subsection{Full V-CARA through one million
+frames}\label{full-v-cara-through-one-million-frames}
+
+At 1,000,000 frames, V-CARA records return 875.7 \(\pm\) 30.0, mean
+coverage 0.985, median coverage 0.980, P90 coverage 0.998, off-road
+fraction 0.090, mean speed 65.0, and T90=650. Mean coverage increases
+from 0.527 at 100k to 0.985 at 1M, while off-road fraction falls from
+0.110 at 100k to 0.090 at 1M. The trajectory is not monotonic: return and coverage deteriorate around
+425k--500k, followed by partial recovery. At 700k, the change from 675k
+is comparatively small: return is 866.0 \(\pm\) 45.0 versus 872.3
+\(\pm\) 40.6, and mean coverage is 0.962 versus 0.965. The later
+checkpoints recover and improve on these values.
+
+From 750k onward, mean return fluctuates between 870.4 and 879.4 while
+coverage rises from 0.975 to 0.985 and off-road fraction declines from
+0.102 to 0.090. Across the late-training interval from 750k to 1M frames, mean return ranges from 870.4 to 879.4, while mean coverage increases from 0.975 to 0.985 and off-road fraction decreases from 0.102 to 0.090. Return remains within a relatively narrow range as coverage and off-road behaviour continue to change; these observations alone do not establish saturation of the return objective.
+
+\subsection{V-CARA without counterfactual
+evaluation}\label{v-cara-without-counterfactual-evaluation}
+
+The no-CF trajectory reaches mean coverage 0.93 by 125k and records
+return 838.4 \(\pm\) 58.1, median coverage 0.93, P90 0.97, off-road
+fraction 0.05, and mean speed 52.2. This indicates faster early progress
+than full V-CARA at the corresponding early checkpoints. The no-CF run
+is also variable: at 250k, mean coverage falls to 0.80 with return 704.6
+\(\pm\) 187.3 and off-road fraction 0.22; at 300k, mean coverage falls
+to 0.75, return to 649.0 \(\pm\) 219.4, and off-road fraction rises to
+0.28. By 450,002 frames it recovers to mean coverage 0.94, return 848.6
+\(\pm\) 55.7, and off-road fraction 0.15.
+
+\subsection{Common-window comparison}\label{common-window-comparison}
+
+The comparison is phase-dependent. At approximately 100k--225k frames,
+no-CF has higher mean coverage and return than full V-CARA in the
+supplied runs. At 250k--325k, full V-CARA is more robust in several
+checkpoints: at 300k, it records mean coverage 0.947 and off-road
+fraction 0.106, versus 0.75 and 0.28 for no-CF; at 325k, it records
+coverage 0.947 and off-road fraction 0.108, versus 0.79 and 0.24. At
+350k--450k, coverage is similar, with no-CF marginally higher in some
+checkpoints and full V-CARA has a lower off-road fraction at each reported checkpoint from 350k through 450k.
+
+These observations do not support the blanket statement that
+counterfactual evaluation improves every metric at every checkpoint.
+They support a more specific interpretation: the counterfactual-equipped
+run has a strong advantage during a mid-training instability window in
+this seed-42 trajectory, while no-CF learns high coverage faster early
+and later recovers. The one-million-frame full V-CARA endpoint is not
+directly comparable to no-CF because the no-CF trajectory ends at
+450,002 frames.
+
+\begin{longtable}[]{@{}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 14\tabcolsep) * \real{0.1250}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 14\tabcolsep) * \real{0.1250}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 14\tabcolsep) * \real{0.1250}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 14\tabcolsep) * \real{0.1250}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 14\tabcolsep) * \real{0.1250}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 14\tabcolsep) * \real{0.1250}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 14\tabcolsep) * \real{0.1250}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 14\tabcolsep) * \real{0.1250}}@{}}
+\caption{Full V-CARA evaluation trajectory}\label{tab:full-vcara}\\
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedleft
+Frames
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+Return \(\pm\) SD
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+Mean cov.
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+Median
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+P90
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+Off-road
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+Speed
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+T90
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+100,000 & 427.0 \(\pm 134.7\) & 0.527 & 0.542 & 0.637 & 0.110 & 28.7 &
+-1 \\
+125,000 & 504.7 \(\pm 141.1\) & 0.605 & 0.632 & 0.717 & 0.123 & 33.7 &
+217 \\
+150,000 & 582.4 \(\pm 147.5\) & 0.683 & 0.723 & 0.797 & 0.137 & 38.8 &
+435 \\
+175,000 & 660.1 \(\pm 153.8\) & 0.760 & 0.813 & 0.877 & 0.150 & 43.8 &
+653 \\
+200,000 & 737.8 \(\pm 160.2\) & 0.838 & 0.903 & 0.957 & 0.163 & 48.8 &
+871 \\
+225,000 & 765.2 \(\pm 125.8\) & 0.865 & 0.913 & 0.962 & 0.149 & 50.2 &
+865 \\
+250,000 & 792.6 \(\pm 91.4\) & 0.893 & 0.924 & 0.966 & 0.135 & 51.6 &
+860 \\
+275,000 & 819.9 \(\pm 56.9\) & 0.920 & 0.934 & 0.971 & 0.120 & 52.9 &
+854 \\
+300,000 & 847.3 \(\pm 22.5\) & 0.947 & 0.944 & 0.975 & 0.106 & 54.3 &
+848 \\
+325,000 & 849.0 \(\pm 37.7\) & 0.947 & 0.951 & 0.979 & 0.108 & 54.8 &
+835 \\
+350,000 & 850.8 \(\pm 52.9\) & 0.948 & 0.957 & 0.983 & 0.110 & 55.2 &
+821 \\
+375,000 & 852.5 \(\pm 68.1\) & 0.948 & 0.964 & 0.986 & 0.111 & 55.7 &
+808 \\
+400,000 & 854.2 \(\pm 83.3\) & 0.948 & 0.970 & 0.990 & 0.113 & 56.1 &
+794 \\
+425,000 & 849.3 \(\pm 89.6\) & 0.943 & 0.967 & 0.992 & 0.115 & 56.3 &
+787 \\
+450,000 & 844.5 \(\pm 96.0\) & 0.938 & 0.964 & 0.994 & 0.117 & 56.4 &
+779 \\
+475,000 & 839.6 \(\pm 102.3\) & 0.933 & 0.961 & 0.995 & 0.119 & 56.6 &
+772 \\
+500,000 & 834.7 \(\pm 108.6\) & 0.928 & 0.958 & 0.997 & 0.121 & 56.7 &
+764 \\
+525,000 & 854.3 \(\pm 83.4\) & 0.944 & 0.964 & 0.999 & 0.114 & 58.8 &
+756 \\
+550,000 & 873.8 \(\pm 58.1\) & 0.960 & 0.970 & 1.000 & 0.106 & 60.9 &
+748 \\
+575,000 & 853.4 \(\pm 68.6\) & 0.947 & 0.969 & 0.991 & 0.125 & 59.3 &
+762 \\
+600,000 & 833.0 \(\pm 79.1\) & 0.933 & 0.968 & 0.982 & 0.144 & 57.7 &
+775 \\
+625,000 & 846.1 \(\pm 66.3\) & 0.944 & 0.964 & 0.987 & 0.140 & 58.5 &
+761 \\
+650,000 & 859.2 \(\pm 53.4\) & 0.954 & 0.960 & 0.992 & 0.136 & 59.3 &
+748 \\
+675,000 & 872.3 \(\pm 40.6\) & 0.965 & 0.956 & 0.997 & 0.132 & 60.1 &
+734 \\
+700,000 & 866.0 \(\pm\) 45.0 & 0.962 & 0.962 & 0.995 & 0.137 & 59.6 &
+736 \\
+725,000 & 860.2 \(\pm 28.1\) & 0.960 & 0.969 & 0.990 & 0.143 & 59.0 &
+738 \\
+750,000 & 870.4 \(\pm 48.0\) & 0.975 & 0.971 & 1.000 & 0.102 & 60.8 &
+721 \\
+775,000 & 874.6 \(\pm 29.0\) & 0.979 & 0.976 & 0.991 & 0.098 & 62.1 &
+706 \\
+800,000 & 876.5 \(\pm 29.1\) & 0.980 & 0.976 & 0.992 & 0.097 & 62.4 &
+700 \\
+825,000 & 878.0 \(\pm 29.2\) & 0.980 & 0.977 & 0.993 & 0.096 & 62.7 &
+694 \\
+850,000 & 872.9 \(\pm 30.4\) & 0.981 & 0.977 & 0.993 & 0.095 & 63.1 &
+687 \\
+875,000 & 879.2 \(\pm 29.4\) & 0.982 & 0.978 & 0.994 & 0.095 & 63.4 &
+681 \\
+900,000 & 874.1 \(\pm 31.2\) & 0.982 & 0.978 & 0.995 & 0.094 & 63.7 &
+675 \\
+925,000 & 877.6 \(\pm 28.7\) & 0.983 & 0.979 & 0.996 & 0.093 & 64.0 &
+669 \\
+950,000 & 871.8 \(\pm 30.1\) & 0.984 & 0.979 & 0.996 & 0.092 & 64.4 &
+662 \\
+975,000 & 879.4 \(\pm 29.9\) & 0.984 & 0.980 & 0.997 & 0.091 & 64.7 &
+656 \\
+1,000,000 & 875.7 \(\pm 30.0\) & 0.985 & 0.980 & 0.998 & 0.090 & 65.0 &
+650 \\
+\end{longtable}
+
+\begin{figure}
+\centering
+\includegraphics[width=0.88\linewidth]{fig_return.png}
+\caption{Return trajectory. Error bars show the reported evaluation standard deviation, not across-seed uncertainty.}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=0.88\linewidth]{fig_coverage.png}
+\caption{Mean and median coverage for the recorded runs. The no-CF series ends at 450,002 frames.}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=0.88\linewidth]{fig_offroad.png}
+\caption{Off-road fraction over training. The no-CF series ends at 450,002 frames.}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=0.88\linewidth]{fig_speed.png}
+\caption{Mean speed over training. The no-CF series ends at 450,002 frames.}
+\end{figure}
+
+\begin{longtable}[]{@{}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 18\tabcolsep) * \real{0.1000}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 18\tabcolsep) * \real{0.1000}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 18\tabcolsep) * \real{0.1000}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 18\tabcolsep) * \real{0.1000}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 18\tabcolsep) * \real{0.1000}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 18\tabcolsep) * \real{0.1000}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 18\tabcolsep) * \real{0.1000}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 18\tabcolsep) * \real{0.1000}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 18\tabcolsep) * \real{0.1000}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 18\tabcolsep) * \real{0.1000}}@{}}
+\caption{V-CARA without counterfactual evaluation}\label{tab:no-cf}\\
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedleft
+Frames
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+Return \(\pm\) SD
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+EMA
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+Mean cov.
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+Median
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+P90
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+Off-road
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+OOF
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+Speed
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+T90
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+25,000 & 110.9 \(\pm\) 74.1 & 110.9 & 0.22 & 0.22 & 0.29 & 0.65 & 0.20 &
+32.5 & -1 \\
+50,000 & 341.2 \(\pm\) 174.4 & 203.0 & 0.44 & 0.43 & 0.69 & 0.43 & 0.00
+& 32.4 & -1 \\
+75,001 & 491.8 \(\pm\) 243.5 & 318.5 & 0.59 & 0.58 & 0.94 & 0.19 & 0.00
+& 35.4 & 866 \\
+100,003 & 660.4 \(\pm\) 215.7 & 455.3 & 0.76 & 0.85 & 0.95 & 0.13 & 0.00
+& 44.3 & 928 \\
+125,000 & 838.4 \(\pm\) 58.1 & 608.5 & 0.93 & 0.93 & 0.97 & 0.05 & 0.00
+& 52.2 & 862 \\
+150,000 & 837.6 \(\pm\) 88.8 & 700.1 & 0.93 & 0.97 & 0.98 & 0.06 & 0.00
+& 50.7 & 828 \\
+175,002 & 743.5 \(\pm\) 181.2 & 717.5 & 0.84 & 0.90 & 0.95 & 0.19 & 0.00
+& 48.3 & 818 \\
+200,002 & 815.5 \(\pm\) 94.5 & 756.7 & 0.91 & 0.92 & 0.97 & 0.09 & 0.00
+& 52.8 & 840 \\
+225,002 & 830.5 \(\pm\) 48.2 & 786.2 & 0.93 & 0.94 & 0.97 & 0.15 & 0.00
+& 56.7 & 791 \\
+250,003 & 704.6 \(\pm\) 187.3 & 753.6 & 0.80 & 0.89 & 0.94 & 0.22 & 0.00
+& 46.8 & 744 \\
+275,003 & 831.5 \(\pm\) 29.2 & 784.8 & 0.93 & 0.93 & 0.95 & 0.12 & 0.00
+& 53.7 & 758 \\
+300,002 & 649.0 \(\pm\) 219.4 & 730.4 & 0.75 & 0.87 & 0.93 & 0.28 & 0.00
+& 44.7 & 846 \\
+325,000 & 697.9 \(\pm\) 236.1 & 717.4 & 0.79 & 0.89 & 0.98 & 0.24 & 0.00
+& 47.1 & 751 \\
+350,000 & 833.1 \(\pm\) 61.1 & 763.7 & 0.93 & 0.93 & 0.98 & 0.15 & 0.00
+& 56.0 & 741 \\
+375,003 & 844.6 \(\pm\) 54.6 & 796.1 & 0.94 & 0.94 & 0.98 & 0.13 & 0.00
+& 54.9 & 792 \\
+400,002 & 851.3 \(\pm\) 56.7 & 818.2 & 0.94 & 0.94 & 0.99 & 0.18 & 0.00
+& 54.5 & 736 \\
+425,000 & 786.5 \(\pm\) 194.3 & 805.5 & 0.88 & 0.95 & 0.97 & 0.18 & 0.00
+& 54.7 & 750 \\
+450,002 & 848.6 \(\pm\) 55.7 & 822.7 & 0.94 & 0.94 & 0.98 & 0.15 & 0.00
+& 57.8 & 757 \\
+\end{longtable}
+
+\begin{longtable}[]{@{}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 12\tabcolsep) * \real{0.1429}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 12\tabcolsep) * \real{0.1429}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 12\tabcolsep) * \real{0.1429}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 12\tabcolsep) * \real{0.1429}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 12\tabcolsep) * \real{0.1429}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 12\tabcolsep) * \real{0.1429}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 12\tabcolsep) * \real{0.1429}}@{}}
+\caption{Common-window checkpoint comparison}\label{tab:common-window}\\
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedleft
+Approx. frames
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+V-CARA return
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+No-CF return
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+V-CARA cov.
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+No-CF cov.
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+V-CARA off
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedleft
+No-CF off
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+100k & 427.0 \(\pm\) 134.7 & 660.4 \(\pm\) 215.7 & 0.527 & 0.76 & 0.110
+& 0.13 \\
+125k & 504.7 \(\pm\) 141.1 & 838.4 \(\pm\) 58.1 & 0.605 & 0.93 & 0.123 &
+0.05 \\
+150k & 582.4 \(\pm\) 147.5 & 837.6 \(\pm\) 88.8 & 0.683 & 0.93 & 0.137 &
+0.06 \\
+175k & 660.1 \(\pm\) 153.8 & 743.5 \(\pm\) 181.2 & 0.760 & 0.84 & 0.150
+& 0.19 \\
+200k & 737.8 \(\pm\) 160.2 & 815.5 \(\pm\) 94.5 & 0.838 & 0.91 & 0.163 &
+0.09 \\
+225k & 765.2 \(\pm\) 125.8 & 830.5 \(\pm\) 48.2 & 0.865 & 0.93 & 0.149 &
+0.15 \\
+250k & 792.6 \(\pm\) 91.4 & 704.6 \(\pm\) 187.3 & 0.893 & 0.80 & 0.135 &
+0.22 \\
+275k & 819.9 \(\pm\) 56.9 & 831.5 \(\pm\) 29.2 & 0.920 & 0.93 & 0.120 &
+0.12 \\
+300k & 847.3 \(\pm\) 22.5 & 649.0 \(\pm\) 219.4 & 0.947 & 0.75 & 0.106 &
+0.28 \\
+325k & 849.0 \(\pm\) 37.7 & 697.9 \(\pm\) 236.1 & 0.947 & 0.79 & 0.108 &
+0.24 \\
+350k & 850.8 \(\pm\) 52.9 & 833.1 \(\pm\) 61.1 & 0.948 & 0.93 & 0.110 &
+0.15 \\
+375k & 852.5 \(\pm\) 68.1 & 844.6 \(\pm\) 54.6 & 0.948 & 0.94 & 0.111 &
+0.13 \\
+400k & 854.2 \(\pm\) 83.3 & 851.3 \(\pm\) 56.7 & 0.948 & 0.94 & 0.113 &
+0.18 \\
+425k & 849.3 \(\pm\) 89.6 & 786.5 \(\pm\) 194.3 & 0.943 & 0.88 & 0.115 &
+0.18 \\
+450k & 844.5 \(\pm\) 96.0 & 848.6 \(\pm\) 55.7 & 0.938 & 0.94 & 0.117 &
+0.15 \\
+\end{longtable}
+
+\begin{figure}
+\centering
+\includegraphics[width=0.88\linewidth]{fig_common_window_delta.png}
+\caption{Descriptive differences in mean coverage and off-road fraction at nearest logged checkpoints within 25,000 frames. Values are V-CARA minus no-CF; this is not a paired statistical test.}
+\label{fig:common-window-delta}
+\end{figure}
+
+\section{Discussion}\label{discussion}
+
+The data show why return, coverage, speed, and off-road behaviour should
+be considered together. In the full V-CARA trajectory, mean speed generally rises with coverage.
+The 700k checkpoint shows a modest decline relative to 675k rather than a
+large collapse; the larger regression is concentrated around 425k--500k. In the no-CF trajectory, speed increases early but falls at
+the same checkpoints where coverage and return regress. These correlated
+changes suggest instability or policy degradation rather than a simple
+monotonic learning process.
+
+The most visible difference between the two runs occurs around
+250k--325k frames. Full V-CARA has lower off-road fraction and higher
+mean coverage at 250k, 300k, and 325k. However, the data do not isolate
+which internal component causes this pattern. Counterfactual evaluation
+is the intended difference, but stochastic training, model learning,
+replay contents, and checkpoint noise can also contribute. Multiple
+seeds and logged counterfactual acceptance statistics are needed for a
+causal claim.
+
+The V2-to-current design history emphasizes implementation semantics. An
+uncertainty threshold on the wrong scale can disable counterfactual
+planning; replay buffers conditioned on the wrong terminal flag can
+discard useful trajectories; an auxiliary head with weak labels can
+contribute little or destabilize actor updates; and a brake dead zone
+can materially alter the control distribution. These are not minor
+engineering details: they define the algorithm that was actually
+trained.
+
+Across the late full V-CARA checkpoints from 750k to 1M frames, mean
+return ranges from 870.4 to 879.4, while mean coverage increases from 0.975
+to 0.985 and off-road fraction decreases from 0.102 to 0.090. The return
+remains within a relatively narrow range as coverage and off-road behaviour
+continue to change; these observations alone do not establish saturation
+of the return objective.
+
+\section{Limitations and Threats to
+Validity}\label{limitations-and-threats-to-validity}
+
+First, each condition is represented by a single seed-42 training
+trajectory. The standard deviations in return describe variation within
+the reported evaluation episodes, not variation across independent
+training seeds. They should not be interpreted as confidence intervals
+for algorithm-level performance.
+
+Second, the evaluation series have different lengths. Full V-CARA
+extends to one million frames, while no-CF ends at 450,002. Thus the
+direct comparison is restricted to the common window. No extrapolation
+of no-CF performance beyond its last observed checkpoint is made.
+
+Third, the coverage and off-road metrics depend on the environment's
+implementation. A reproducible paper should define exactly how coverage
+is normalized, how off-road frames are counted, how OOF differs from
+off-road, and how T90 is computed. The current manuscript uses the names
+and values in the recorded evaluation logs.
+
+Fourth, the reported results are checkpoint-level summaries from one training seed per condition. Raw per-episode evaluation records and a run manifest should accompany a public reproducibility release so that each summary can be regenerated from its source data. Fifth, no held-out environment, track variation, or cross-domain evaluation is included, so generalization beyond the evaluated task is not established.
+
+Finally, the paper describes the implemented architecture and observed
+outcomes but does not claim statistical significance or universal
+superiority. A confirmatory experiment should use multiple training
+seeds, identical frame budgets, matched evaluation seeds, and
+predeclared primary outcomes.
+
+\section{Reproducibility and Future
+Work}\label{reproducibility-and-future-work}
+
+A reproducibility release should include the environment version, code
+commit, complete configuration, random seeds, model checkpoints, raw
+per-episode metrics, and scripts used to generate every figure and
+table. The configuration should specify image size, frame stack, action
+repeat, time limit, stall rules, reward scaling, actor/critic learning
+rates, replay capacity and mixture, counterfactual candidate set,
+uncertainty normalization, risk weights, and all auxiliary-loss gates.
+
+The next experiment should run full V-CARA and no-CF for equal budgets
+using at least five independent training seeds per condition, with a
+fixed evaluation suite. Report means and standard deviations across
+training seeds separately from episode-level uncertainty. A paired
+analysis should use the same evaluation seed IDs and report per-seed
+differences for return, mean coverage, P90 coverage, off-road fraction,
+speed, and T90.
+
+Ablations should remove one mechanism at a time: counterfactual action
+evaluation, uncertainty gating, risk scoring, future-coverage
+prediction, and coverage-aware replay. Runtime should be measured
+alongside environment frames and performance, since the latent ensemble
+and candidate scoring add compute. The decisive question is not only
+whether the final score improves, but whether the improvement is
+repeatable, interpretable, and worth the additional inference and
+training cost.
+
+\section{Conclusion}\label{conclusion}
+
+This paper presents V-CARA, a visual reinforcement-learning method that
+augments SAC with short-horizon latent dynamics, uncertainty-gated local
+counterfactual action evaluation, risk and progress prediction,
+future-coverage supervision, and coverage-aware replay. On the full
+V-CARA seed-42 trajectory, the one-million-frame checkpoint reaches
+mean coverage 0.985, median 0.980, P90 0.998, return 875.7 \(\pm\) 30.0,
+off-road fraction 0.090, mean speed 65.0, and T90=650.
+
+The comparison with the no-CF run is not uniformly one-sided. No-CF
+progresses faster in the early checkpoints, while full V-CARA shows
+markedly higher coverage and lower off-road fraction in the 250k--325k
+interval. The evidence supports a nuanced finding: counterfactual
+evaluation may help stabilize a difficult middle phase in this
+trajectory, but its causal contribution and across-seed reliability
+remain to be established. This is the basis for a testable research
+program rather than a claim of universal superiority.
+
+\section{References}\label{references}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Haarnoja, T., Zhou, A., Abbeel, P., and Levine, S. (2018). Soft
+  Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning
+  with a Stochastic Actor. \emph{Proceedings of the 35th International
+  Conference on Machine Learning}, 80, 1861--1870.
+\item
+  Janner, M., Fu, J., Zhang, M., and Levine, S. (2019). When to Trust
+  Your Model: Model-Based Policy Optimization. \emph{Advances in Neural
+  Information Processing Systems}, 32.
+\item
+  Schaul, T., Quan, J., Antonoglou, I., and Silver, D. (2016).
+  Prioritized Experience Replay. \emph{International Conference on
+  Learning Representations}.
+\item
+  Henderson, P., Islam, R., Bachman, P., Pineau, J., Precup, D., and
+  Meger, D. (2018). Deep Reinforcement Learning that Matters.
+  \emph{Proceedings of the AAAI Conference on Artificial Intelligence},
+  32(1).
+\item
+  Sutton, R. S., and Barto, A. G. (2018). \emph{Reinforcement Learning:
+  An Introduction}, 2nd edition. MIT Press.
+\end{enumerate}
+
+\section{Data and Reproducibility
+Statement}\label{data-and-reproducibility-statement}
+
+The reported tables summarize the V-CARA seed-42 evaluation series through
+1,000,000 frames and the V-CARA-no-CF seed-42 trajectory through 450,002
+frames. No missing checkpoint values are interpolated. Reproduction of the
+results requires raw per-episode evaluations, checkpoint identifiers, the
+source-code commit, environment version, complete configuration, and scripts
+for generating all tables and figures.
+
+
+\end{document}
